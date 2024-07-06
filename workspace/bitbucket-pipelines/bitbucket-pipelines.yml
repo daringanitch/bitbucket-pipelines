@@ -1,0 +1,98 @@
+image: maven:3.6.3-jdk-13
+
+definitions:
+  caches:
+    sonar: ~/.sonar/cache
+  services:
+    docker:
+      memory: 3072
+  steps:
+    - step: &sonar-cloud
+        name: Code Quality Analysis with SonarCloud
+        caches:
+          - sonar
+        script:
+          - pipe: sonarsource/sonarcloud-scan:2.0.0
+            variables:
+              SONAR_TOKEN: $SONAR_TOKEN
+              EXTRA_ARGS: '-Dsonar.exclusions=**/*.java'
+    - step: &build-jar
+        name: Build jar file
+        script:
+          - yum install python3-pip -y
+          - pip3 install awscli --upgrade
+          - export CODEARTIFACT_AUTH_TOKEN=$(aws codeartifact get-authorization-token --domain $DOMAIN --domain-owner $AWS_ACCOUNT_ID --query authorizationToken --output text)
+          - echo $CODEARTIFACT_AUTH_TOKEN
+          - sed -i "s/EXECUTION_SERVICE_VERSION/$PACKAGE_VERSION/" pom.xml
+          - mvn clean package -s settings.xml -e -DskipTests # Compiles and packages the project
+          - mvn deploy -s settings.xml -DskipTests
+    - step: &deploy-to-ec2
+        name: Deploy to EC2
+        script:
+          - yum install python3-pip jq -y
+          - pip3 install awscli --upgrade
+          - ASSET_NAME=$(aws codeartifact list-package-version-assets --region $REPO_REGION --domain $DOMAIN --domain-owner $AWS_ACCOUNT_ID --repository execution-service --format maven --namespace com --package executionservice --package-version $PACKAGE_VERSION | jq .assets[0].name | tr -d '"')
+          - aws ssm send-command --targets "Key=instanceids,Values=$INSTANCE_IDS" --document-name "AWS-RunShellScript" --parameters "commands=aws codeartifact get-package-version-asset --region $REPO_REGION --domain $DOMAIN --domain-owner $AWS_ACCOUNT_ID --repository execution-service --format maven --namespace com --package executionservice --package-version $PACKAGE_VERSION --asset $ASSET_NAME $SERVICE_DIR/execution-service/execution-service.jar,sh $SERVICE_DIR/execution-service/executionrestart.sh"
+
+  stages:
+    - stage: &sonar-cloud-stage
+        name: Sonar Cloud
+        steps:
+          - step: *sonar-cloud
+    - stage: &deploy-to-dev-stage
+        name: Deploy to Development
+        deployment: Development
+        steps:
+          - step: *build-jar
+          - step: *deploy-to-ec2
+    - stage: &deploy-to-uat-stage
+        name: Deploy to Staging
+        deployment: Staging
+        steps:
+          - step: *build-jar
+          - step: *deploy-to-ec2
+    - stage: &deploy-to-us-prod-stage
+       name: Deploy to US Prod
+       deployment: US Prod
+       steps:
+         - step: *deploy-to-ec2
+    - stage: &deploy-to-uk-prod-stage
+       name: Deploy to UK Prod
+       deployment: UK Prod
+       steps:
+         - step: *deploy-to-ec2
+    - stage: &deploy-to-ind-prod-stage
+       name: Deploy to IND Prod
+       deployment: IND Prod
+       steps:
+         - step: *deploy-to-ec2
+
+pipelines:
+  default:
+    - stage: *sonar-cloud-stage
+  custom:
+    dev:
+      - variables:
+          - name: PACKAGE_VERSION
+            type: string
+      - stage: *deploy-to-dev-stage
+    staging:
+      - variables:
+          - name: PACKAGE_VERSION
+            type: string
+      - stage: *deploy-to-uat-stage
+    us-prod:
+      - variables:
+          - name: PACKAGE_VERSION
+            type: string
+      - stage: *deploy-to-us-prod-stage
+    uk-prod:
+      - variables:
+          - name: PACKAGE_VERSION
+            type: string
+      - stage: *deploy-to-uk-prod-stage
+    ind-prod:
+      - variables:
+          - name: PACKAGE_VERSION
+            type: string
+      - stage: *deploy-to-ind-prod-stage
